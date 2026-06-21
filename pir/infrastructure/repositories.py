@@ -1,4 +1,6 @@
-from pir.domain.entities import PirEvent
+from typing import List
+
+from pir.domain.entities import PirEvent, PirClassification
 from pir.infrastructure.models import PirEvent as PirEventModel
 
 
@@ -14,6 +16,22 @@ class PirEventRepository:
             triggers_per_minute=event.triggers_per_minute,
             classification=event.classification.value,
             recorded_at=event.recorded_at,
+            synced=False,
         )
         event.id = row.id
         return event
+
+    @staticmethod
+    def find_unsynced(limit: int = 50) -> List[PirEventModel]:
+        return list(
+            PirEventModel.select()
+            .where(PirEventModel.synced == False)
+            .order_by(PirEventModel.recorded_at)
+            .limit(limit)
+        )
+
+    @staticmethod
+    def mark_synced(ids: List[int]) -> None:
+        if not ids:
+            return
+        PirEventModel.update(synced=True).where(PirEventModel.id.in_(ids)).execute()
