@@ -6,7 +6,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = os.getenv("CLOUD_API_URL", "http://localhost:8080")
+_BASE_URL = os.getenv("CLOUD_API_URL", "http://agrosafe-back.eastus2.azurecontainer.io:8080")
 _TOKEN = os.getenv("CLOUD_API_TOKEN", "")
 _TIMEOUT = 10  # seconds
 
@@ -58,6 +58,40 @@ def post_heartbeat(device_id: int, battery_level: float | None = None) -> bool:
         return False
     except requests.RequestException as exc:
         logger.warning("Heartbeat error: %s", exc)
+        return False
+
+
+def post_security_event(
+    device_id: int,
+    zone_id: int | None,
+    classification: str,
+    triggers_per_minute: int,
+    pulse_duration_ms: float,
+    recorded_at: str,
+) -> bool:
+    """POST a single PIR security event to /api/v1/security/events/ingest.
+    Returns True on success.
+    """
+    if not _enabled():
+        return False
+    url = f"{_BASE_URL}/api/v1/security/events/ingest"
+    body = {
+        "deviceId": device_id,
+        "zoneId": zone_id,
+        "classification": classification,
+        "triggersPerMinute": triggers_per_minute,
+        "pulseDurationMs": pulse_duration_ms,
+        "recordedAt": recorded_at,
+    }
+    try:
+        resp = requests.post(url, json=body, headers=_headers(), timeout=_TIMEOUT)
+        if resp.status_code in (200, 201):
+            logger.debug("Security event posted — device %s %s", device_id, classification)
+            return True
+        logger.warning("Security event post failed — HTTP %s: %s", resp.status_code, resp.text[:200])
+        return False
+    except requests.RequestException as exc:
+        logger.warning("Security event post error: %s", exc)
         return False
 
 

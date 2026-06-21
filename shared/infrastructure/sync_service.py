@@ -77,6 +77,41 @@ def _sync_once() -> None:
         db.close()
 
 
+def _sync_pir_once() -> None:
+    """Sync unsynced PIR events to the cloud one by one (no batch endpoint)."""
+    from pir.infrastructure.repositories import PirEventRepository
+
+    repo = PirEventRepository()
+    db.connect(reuse_if_open=True)
+    try:
+        rows = repo.find_unsynced(limit=50)
+        if not rows:
+            return
+        synced_ids = []
+        for row in rows:
+            ts = row.recorded_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            ok = cloud_client.post_security_event(
+                device_id=row.device_id,
+                zone_id=row.zone_id,
+                classification=row.classification,
+                triggers_per_minute=row.triggers_per_minute,
+                pulse_duration_ms=row.pulse_duration_ms,
+                recorded_at=ts,
+            )
+            if ok:
+                synced_ids.append(row.id)
+        if synced_ids:
+            repo.mark_synced(synced_ids)
+            logger.info("Synced %d PIR events to cloud", len(synced_ids))
+        failed = len(rows) - len(synced_ids)
+        if failed:
+            logger.warning("PIR cloud sync: %d events failed — will retry next cycle", failed)
+    except Exception as exc:
+        logger.error("PIR sync error: %s", exc)
+    finally:
+        db.close()
+
+
 async def _run_loop() -> None:
     """Async periodic sync loop — runs via asyncio.gather() for concurrency."""
     delay = _SYNC_INTERVAL
@@ -84,6 +119,7 @@ async def _run_loop() -> None:
         await asyncio.sleep(delay)
         try:
             await asyncio.to_thread(_sync_once)
+            await asyncio.to_thread(_sync_pir_once)
             delay = _SYNC_INTERVAL
         except Exception as exc:
             logger.error("Unexpected sync error: %s", exc)

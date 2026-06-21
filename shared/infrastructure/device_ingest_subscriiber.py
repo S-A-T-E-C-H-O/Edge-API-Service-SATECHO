@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
+from iam.infrastructure.repositories import DeviceRepository
+from shared.infrastructure.device_tracker import mark_seen
 from shared.infrastructure.mqtt_client import get_mqtt_client, register_handler
 
 logger = logging.getLogger(__name__)
 
-_EDGE_API_KEY = os.getenv("MQTT_EDGE_API_KEY", "edge-shared-secret-change-me")
-
-# Raw topics published by ESP32 (no api_key, no zone_id, embedded format)
+# Raw topics published by ESP32 (no zone_id, embedded format)
 _TOPIC_RAW_SOIL     = "agrosafe/raw/+/+/soil/reading"
 _TOPIC_RAW_SECURITY = "agrosafe/raw/+/+/security/event"
 
@@ -28,6 +28,11 @@ _METRIC_MAP = {
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_device(device_id: int, farm_id: int, mac: str) -> None:
+    """Zero-touch provisioning: register device on first contact if unknown."""
+    DeviceRepository.find_or_create_by_mac(device_id, farm_id, mac)
 
 
 def _extract_ids(topic: str) -> tuple[str, str]:
@@ -50,6 +55,7 @@ def _handle_soil(topic: str, payload: str) -> None:
     farm_id, device_id = _extract_ids(topic)
     metrics: dict = {}
     timestamp = _now_iso()
+    mac = ""
 
     for r in readings:
         metric_type = r.get("metricType", "")
@@ -58,9 +64,18 @@ def _handle_soil(topic: str, payload: str) -> None:
             metrics[field] = r.get("value")
         if r.get("timestamp"):
             timestamp = r["timestamp"]
+        if not mac and r.get("mac_address"):
+            mac = r["mac_address"]
+
+    if not mac:
+        logger.warning("Soil payload from device %s has no mac_address — dropping", device_id)
+        return
+
+    _ensure_device(int(device_id), int(farm_id), mac)
+    mark_seen(int(device_id))
 
     out_payload = json.dumps({
-        "api_key":             _EDGE_API_KEY,
+        "api_key":             mac,
         "zone_id":             _DEFAULT_ZONE_ID,
         "moisture":            metrics.get("moisture"),
         "ec":                  metrics.get("ec"),
@@ -87,10 +102,18 @@ def _handle_security(topic: str, payload: str) -> None:
         return
 
     farm_id, device_id = _extract_ids(topic)
+    mac = data.get("mac_address", "")
     classification = data.get("classification", "UNKNOWN")
 
+    if not mac:
+        logger.warning("Security payload from device %s has no mac_address — dropping", device_id)
+        return
+
+    _ensure_device(int(device_id), int(farm_id), mac)
+    mark_seen(int(device_id))
+
     out_payload = json.dumps({
-        "api_key":              _EDGE_API_KEY,
+        "api_key":              mac,
         "zone_id":              _DEFAULT_ZONE_ID,
         "pulse_duration_ms":    0,
         "triggers_per_minute":  1 if data.get("security_pir_status") == "DETECTED" else 0,
