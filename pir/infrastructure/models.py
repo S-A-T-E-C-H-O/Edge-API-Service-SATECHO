@@ -1,4 +1,4 @@
-from peewee import Model, AutoField, IntegerField, FloatField, CharField, DateTimeField
+from peewee import Model, AutoField, IntegerField, FloatField, CharField, DateTimeField, BooleanField
 
 from shared.infrastructure.database import db
 
@@ -12,6 +12,7 @@ class PirEvent(Model):
     triggers_per_minute = IntegerField()
     classification      = CharField()   # WIND | ANIMAL | PERSON
     recorded_at         = DateTimeField()
+    synced              = BooleanField(default=False)
 
     class Meta:
         database   = db
