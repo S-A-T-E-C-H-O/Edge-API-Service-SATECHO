@@ -20,6 +20,7 @@ def _migrate() -> None:
     _add_column_if_missing("soil_readings", "synced",   "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing("soil_readings", "ambient_temperature", "REAL")
     _add_column_if_missing("soil_readings", "security_pir_status", "VARCHAR(32)")
+    _add_column_if_missing("pir_events", "synced", "INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column_if_missing(table: str, column: str, definition: str) -> None:
