@@ -78,7 +78,11 @@ def _sync_once() -> None:
 
 
 def _sync_pir_once() -> None:
-    """Sync unsynced PIR events to the cloud one by one (no batch endpoint)."""
+    """Synchronize classified PIR events to the cloud individually (no batching).
+
+    Unlike soil telemetry, a failed PIR sync is not enqueued on the retry queue —
+    the event simply stays `synced=False` and is retried on the next periodic cycle.
+    """
     from pir.infrastructure.repositories import PirEventRepository
 
     repo = PirEventRepository()
@@ -89,23 +93,20 @@ def _sync_pir_once() -> None:
             return
         synced_ids = []
         for row in rows:
-            ts = row.recorded_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             ok = cloud_client.post_security_event(
-                device_id=row.device_id,
-                zone_id=row.zone_id,
-                classification=row.classification,
-                triggers_per_minute=row.triggers_per_minute,
-                pulse_duration_ms=row.pulse_duration_ms,
-                recorded_at=ts,
+                row.device_id, row.farm_id, row.zone_id, row.classification,
+                row.triggers_per_minute, row.pulse_duration_ms,
+                # UTC "...Z" sin offset — isoformat() en un datetime tz-aware
+                # produciría "+00:00Z" (Instant inválido para Jackson en el back).
+                row.recorded_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z",
             )
             if ok:
                 synced_ids.append(row.id)
+            else:
+                logger.warning("PIR event sync failed (id=%s) — will retry next cycle", row.id)
         if synced_ids:
             repo.mark_synced(synced_ids)
             logger.info("Synced %d PIR events to cloud", len(synced_ids))
-        failed = len(rows) - len(synced_ids)
-        if failed:
-            logger.warning("PIR cloud sync: %d events failed — will retry next cycle", failed)
     except Exception as exc:
         logger.error("PIR sync error: %s", exc)
     finally:
@@ -113,13 +114,15 @@ def _sync_pir_once() -> None:
 
 
 async def _run_loop() -> None:
-    """Async periodic sync loop — runs via asyncio.gather() for concurrency."""
+    """Async periodic sync loop — soil and PIR sync run concurrently via asyncio.gather()."""
     delay = _SYNC_INTERVAL
     while True:
         await asyncio.sleep(delay)
         try:
-            await asyncio.to_thread(_sync_once)
-            await asyncio.to_thread(_sync_pir_once)
+            await asyncio.gather(
+                asyncio.to_thread(_sync_once),
+                asyncio.to_thread(_sync_pir_once),
+            )
             delay = _SYNC_INTERVAL
         except Exception as exc:
             logger.error("Unexpected sync error: %s", exc)
