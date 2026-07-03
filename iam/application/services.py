@@ -17,3 +17,6 @@ class AuthApplicationService:
 
     def get_or_create_test_device(self) -> Device:
         return self.device_repository.get_or_create_test_device()
+
+    def register_device(self, device_id: int, farm_id: int, mac: str) -> Device:
+        return self.device_repository.find_or_create_by_mac(device_id, farm_id, mac)
