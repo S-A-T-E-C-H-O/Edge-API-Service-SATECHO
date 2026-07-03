@@ -1,6 +1,6 @@
 from typing import List
 
-from pir.domain.entities import PirEvent, PirClassification
+from pir.domain.entities import PirEvent
 from pir.infrastructure.models import PirEvent as PirEventModel
 
 
