@@ -1,4 +1,3 @@
-import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -6,9 +5,6 @@ import peewee
 
 from iam.domain.entities import Device
 from iam.infrastructure.models import Device as DeviceModel
-
-logger = logging.getLogger(__name__)
-
 
 class DeviceRepository:
 
@@ -24,24 +20,27 @@ class DeviceRepository:
 
     @staticmethod
     def find_or_create_by_mac(device_id: int, farm_id: int, mac: str) -> Device:
-        """Zero-touch provisioning: register device on first MQTT contact.
-
-        The ESP32 MAC address is used as the api_key — unique per hardware unit,
-        no shared secret required. If the device already exists with a different
-        api_key (legacy), the stored key is updated to the MAC.
+        """Zero-touch provisioning: if device_id is unknown, register it using its
+        MAC address as the api_key so it can authenticate on the very next request.
         """
-        row, created = DeviceModel.get_or_create(
+        row, _ = DeviceModel.get_or_create(
             device_id=device_id,
             defaults={
                 "farm_id": farm_id,
                 "api_key": mac,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(timezone.utc),
             },
         )
-        if created:
-            logger.info("Device provisioned — id=%d farm=%d mac=%s", device_id, farm_id, mac)
-        elif row.api_key != mac:
-            DeviceModel.update(api_key=mac).where(DeviceModel.device_id == device_id).execute()
-            row.api_key = mac
-            logger.info("Device api_key updated to MAC — id=%d mac=%s", device_id, mac)
+        return Device(row.device_id, row.farm_id, row.api_key, row.created_at)
+
+    @staticmethod
+    def get_or_create_test_device() -> Device:
+        row, _ = DeviceModel.get_or_create(
+            device_id=5,
+            defaults={
+                "farm_id": 1,
+                "api_key": "test-sensor-key-123",
+                "created_at": "2026-06-15T00:00:00Z",
+            },
+        )
         return Device(row.device_id, row.farm_id, row.api_key, row.created_at)
