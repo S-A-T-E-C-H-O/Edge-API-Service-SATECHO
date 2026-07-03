@@ -1,44 +1,34 @@
-"""Actuator command subscriber.
+"""Actuator command subscriber with an offline buffer (EP-005-TS007).
 
-Intercepts backend→device actuator commands published to:
-    agrosafe/{farm}/devices/{device}/actuator/command
-
-For each command the edge:
-1. Logs the command to the cloud via post_actuator_log().
-2. Republishes to the embedded raw topic so the ESP32 receives it.
-   If the device is offline (no data seen in the last 60 s), the command
-   is buffered in memory and replayed when the device comes back online.
+ESP32 devices are already subscribed directly to the shared MQTT broker on the
+same actuator command topic, so under normal conditions delivery does not
+depend on the Edge. What the Edge adds is resilience: if a device has not been
+seen recently (device_tracker.is_online() is False), the command cannot be
+guaranteed to reach it, so it is buffered here and re-published the moment the
+device is observed online again (see drain_pending(), called from
+device_ingest_subscriiber after every mark_seen()).
 """
 
 import json
 import logging
+import threading
 
 import paho.mqtt.client as mqtt
 
-from shared.infrastructure import cloud_client
-from shared.infrastructure.device_tracker import buffer_command, is_online
+from shared.infrastructure import cloud_client, device_tracker
 from shared.infrastructure.mqtt_client import get_mqtt_client, register_handler
 
 logger = logging.getLogger(__name__)
 
-# Backend publishes commands here; edge intercepts
-_TOPIC_ACTUATOR_CMD = "agrosafe/+/devices/+/actuator/command"
+_TOPIC_ACTUATOR_COMMAND = "agrosafe/+/devices/+/actuator/command"
+
+_pending_commands: dict[int, list[tuple[str, str, object, str, str]]] = {}
+_lock = threading.Lock()
 
 
-def _extract_ids(topic: str) -> tuple[str, str]:
-    """Return (farm_id, device_id) from agrosafe/{farm}/devices/{device}/actuator/command."""
-    parts = topic.split("/")
-    return parts[1], parts[3]
-
-
-def _republish(topic: str, payload: str) -> None:
-    """Republish an actuator command to the same topic (device picks it up from broker)."""
-    client = get_mqtt_client()
-    info = client.publish(topic, payload, qos=1)
-    if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        logger.error("Actuator relay publish failed (topic=%s): %s", topic, mqtt.error_string(info.rc))
-    else:
-        logger.debug("Actuator command relayed: %s", topic)
+def _extract_device_id(topic: str) -> int:
+    """Return device_id from agrosafe/{farmId}/devices/{deviceId}/actuator/command."""
+    return int(topic.split("/")[3])
 
 
 def _handle_actuator_command(topic: str, payload: str) -> None:
@@ -48,38 +38,46 @@ def _handle_actuator_command(topic: str, payload: str) -> None:
         logger.error("Invalid JSON on actuator command topic %s", topic)
         return
 
-    farm_id, device_id_str = _extract_ids(topic)
     try:
-        device_id = int(device_id_str)
-    except ValueError:
-        logger.error("Non-integer device_id in topic %s", topic)
+        device_id = _extract_device_id(topic)
+    except (IndexError, ValueError):
+        logger.error("Cannot parse device_id from actuator topic %s", topic)
         return
 
-    actuator_type  = data.get("actuatorType", "VALVE")
-    action         = data.get("action", "UNKNOWN")
-    zone_id        = data.get("zoneId")
-    command_source = data.get("commandSource", "BACKEND")
+    zone_id = data.get("zone_id")
+    action = data.get("action", "UNKNOWN")
+    source = data.get("source", "manual")
 
+    if device_tracker.is_online(device_id):
+        _deliver(topic, payload, device_id, zone_id, action, source)
+    else:
+        with _lock:
+            _pending_commands.setdefault(device_id, []).append((topic, payload, zone_id, action, source))
+        logger.info("Device %s offline — buffered actuator command action=%s", device_id, action)
+
+
+def _deliver(topic: str, payload: str, device_id: int, zone_id, action: str, source: str) -> None:
+    client = get_mqtt_client()
+    info = client.publish(topic, payload, qos=1)
+    success = info.rc == mqtt.MQTT_ERR_SUCCESS
+    if not success:
+        logger.error("Actuator command republish failed (topic=%s): %s", topic, mqtt.error_string(info.rc))
     cloud_client.post_actuator_log(
-        device_id=device_id,
-        zone_id=zone_id,
-        actuator_type=actuator_type,
-        action=action,
-        command_source=command_source,
-        success=True,
-        response_message="relayed by edge",
+        device_id, zone_id, "VALVE", action, source, success,
+        "" if success else mqtt.error_string(info.rc),
     )
 
-    if is_online(device_id):
-        _republish(topic, payload)
-    else:
-        buffer_command(device_id, topic, payload)
+
+def drain_pending(device_id: int) -> None:
+    """Flush any buffered actuator commands for a device that just came back online."""
+    with _lock:
+        pending = _pending_commands.pop(device_id, [])
+    for topic, payload, zone_id, action, source in pending:
+        logger.info("Draining buffered actuator command for device %s: action=%s", device_id, action)
+        _deliver(topic, payload, device_id, zone_id, action, source)
 
 
 def start() -> None:
-    """Subscribe to actuator command topics and wire up the drain callback."""
-    from shared.infrastructure.device_tracker import set_drain_callback
-    set_drain_callback(_republish)
-
-    register_handler(_TOPIC_ACTUATOR_CMD, _handle_actuator_command)
-    logger.info("Actuator command subscriber started — topic=%s", _TOPIC_ACTUATOR_CMD)
+    """Subscribe to actuator command topics. Call once at app startup."""
+    register_handler(_TOPIC_ACTUATOR_COMMAND, _handle_actuator_command)
+    logger.info("Actuator command subscriber started — topic=%s", _TOPIC_ACTUATOR_COMMAND)
