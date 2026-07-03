@@ -5,13 +5,20 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
-from iam.infrastructure.repositories import DeviceRepository
-from shared.infrastructure.device_tracker import mark_seen
+from shared.infrastructure import device_tracker
 from shared.infrastructure.mqtt_client import get_mqtt_client, register_handler
+
+
+def _mark_seen_and_drain(device_id: int) -> None:
+    device_tracker.mark_seen(device_id)
+    from shared.infrastructure.actuator_command_subscriber import drain_pending
+    drain_pending(device_id)
 
 logger = logging.getLogger(__name__)
 
-# Raw topics published by ESP32 (no zone_id, embedded format)
+_EDGE_API_KEY = os.getenv("MQTT_EDGE_API_KEY", "edge-shared-secret-change-me")
+
+# Raw topics published by ESP32 (no api_key, no zone_id, embedded format)
 _TOPIC_RAW_SOIL     = "agrosafe/raw/+/+/soil/reading"
 _TOPIC_RAW_SECURITY = "agrosafe/raw/+/+/security/event"
 
@@ -28,11 +35,6 @@ _METRIC_MAP = {
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _ensure_device(device_id: int, farm_id: int, mac: str) -> None:
-    """Zero-touch provisioning: register device on first contact if unknown."""
-    DeviceRepository.find_or_create_by_mac(device_id, farm_id, mac)
 
 
 def _extract_ids(topic: str) -> tuple[str, str]:
@@ -53,9 +55,9 @@ def _handle_soil(topic: str, payload: str) -> None:
         return
 
     farm_id, device_id = _extract_ids(topic)
+    _mark_seen_and_drain(int(device_id))
     metrics: dict = {}
     timestamp = _now_iso()
-    mac = ""
 
     for r in readings:
         metric_type = r.get("metricType", "")
@@ -64,18 +66,9 @@ def _handle_soil(topic: str, payload: str) -> None:
             metrics[field] = r.get("value")
         if r.get("timestamp"):
             timestamp = r["timestamp"]
-        if not mac and r.get("mac_address"):
-            mac = r["mac_address"]
-
-    if not mac:
-        logger.warning("Soil payload from device %s has no mac_address — dropping", device_id)
-        return
-
-    _ensure_device(int(device_id), int(farm_id), mac)
-    mark_seen(int(device_id))
 
     out_payload = json.dumps({
-        "api_key":             mac,
+        "api_key":             _EDGE_API_KEY,
         "zone_id":             _DEFAULT_ZONE_ID,
         "moisture":            metrics.get("moisture"),
         "ec":                  metrics.get("ec"),
@@ -87,11 +80,48 @@ def _handle_soil(topic: str, payload: str) -> None:
 
     out_topic = f"agrosafe/{farm_id}/devices/{device_id}/soil/reading"
     client = get_mqtt_client()
+
+    # If we're not connected to the broker right now, the publish would just be
+    # dropped (or queued past paho's outgoing-message limit with no durability
+    # guarantee across a process restart). Fall back to the same SQLite +
+    # retry-queue path the HTTP ingestion route uses, so a broker outage doesn't
+    # silently lose readings (closes the EP-005-US001/US002 "no data loss" gap
+    # for the MQTT relay path, which is the one real firmware actually uses).
+    if not client.is_connected():
+        _persist_soil_fallback(int(device_id), int(farm_id), metrics, timestamp)
+        logger.warning("MQTT not connected — soil reading buffered locally (topic=%s)", out_topic)
+        return
+
     info = client.publish(out_topic, out_payload, qos=1)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        logger.error("Soil relay publish failed (topic=%s): %s", out_topic, mqtt.error_string(info.rc))
+        logger.error("Soil relay publish failed (topic=%s): %s — buffering locally", out_topic, mqtt.error_string(info.rc))
+        _persist_soil_fallback(int(device_id), int(farm_id), metrics, timestamp)
     else:
         logger.debug("Soil reading relayed raw→back: %s", out_topic)
+
+
+def _persist_soil_fallback(device_id: int, farm_id: int, metrics: dict, timestamp: str) -> None:
+    from dateutil.parser import parse
+    from soil.domain.entities import SoilReading
+    from soil.infrastructure.repositories import SoilReadingRepository
+    from shared.infrastructure.database import db
+
+    try:
+        recorded_at = parse(timestamp)
+    except (ValueError, TypeError):
+        recorded_at = datetime.now(timezone.utc)
+
+    db.connect(reuse_if_open=True)
+    try:
+        reading = SoilReading(
+            device_id, farm_id, _DEFAULT_ZONE_ID,
+            metrics.get("moisture") or 0.0, metrics.get("ec") or 0.0, 7.0,
+            metrics.get("temperature") or 0.0, recorded_at,
+            ambient_temperature=metrics.get("ambient_temperature"),
+        )
+        SoilReadingRepository.save(reading)
+    finally:
+        db.close()
 
 
 def _handle_security(topic: str, payload: str) -> None:
@@ -102,32 +132,61 @@ def _handle_security(topic: str, payload: str) -> None:
         return
 
     farm_id, device_id = _extract_ids(topic)
-    mac = data.get("mac_address", "")
-    classification = data.get("classification", "UNKNOWN")
+    _mark_seen_and_drain(int(device_id))
 
-    if not mac:
-        logger.warning("Security payload from device %s has no mac_address — dropping", device_id)
-        return
+    from pir.domain.services import PirClassificationService
 
-    _ensure_device(int(device_id), int(farm_id), mac)
-    mark_seen(int(device_id))
+    pulse_duration_ms = data.get("pulse_duration_ms", 0)
+    triggers_per_minute = data.get("triggers_per_minute", 1)
+    classification = PirClassificationService.classify(pulse_duration_ms, triggers_per_minute)
+    recorded_at = data.get("detectedAt", _now_iso())
 
     out_payload = json.dumps({
-        "api_key":              mac,
+        "api_key":              _EDGE_API_KEY,
         "zone_id":              _DEFAULT_ZONE_ID,
-        "pulse_duration_ms":    0,
-        "triggers_per_minute":  1 if data.get("security_pir_status") == "DETECTED" else 0,
-        "classification":       classification,
-        "recorded_at":          data.get("detectedAt", _now_iso()),
+        "pulse_duration_ms":    pulse_duration_ms,
+        "triggers_per_minute":  triggers_per_minute,
+        "classification":       classification.value,
+        "recorded_at":          recorded_at,
     })
 
     out_topic = f"agrosafe/{farm_id}/devices/{device_id}/security/event"
     client = get_mqtt_client()
+
+    if not client.is_connected():
+        _persist_security_fallback(int(device_id), int(farm_id), pulse_duration_ms, triggers_per_minute,
+                                    classification, recorded_at)
+        logger.warning("MQTT not connected — security event buffered locally (topic=%s)", out_topic)
+        return
+
     info = client.publish(out_topic, out_payload, qos=1)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        logger.error("Security relay publish failed (topic=%s): %s", out_topic, mqtt.error_string(info.rc))
+        logger.error("Security relay publish failed (topic=%s): %s — buffering locally", out_topic, mqtt.error_string(info.rc))
+        _persist_security_fallback(int(device_id), int(farm_id), pulse_duration_ms, triggers_per_minute,
+                                    classification, recorded_at)
     else:
-        logger.debug("Security event relayed raw→back: %s — classification=%s", out_topic, classification)
+        logger.debug("Security event relayed raw→back: %s — classification=%s", out_topic, classification.value)
+
+
+def _persist_security_fallback(device_id: int, farm_id: int, pulse_duration_ms, triggers_per_minute,
+                                classification, recorded_at: str) -> None:
+    from dateutil.parser import parse
+    from pir.domain.entities import PirEvent
+    from pir.infrastructure.repositories import PirEventRepository
+    from shared.infrastructure.database import db
+
+    try:
+        ts = parse(recorded_at)
+    except (ValueError, TypeError):
+        ts = datetime.now(timezone.utc)
+
+    db.connect(reuse_if_open=True)
+    try:
+        event = PirEvent(device_id, farm_id, _DEFAULT_ZONE_ID, float(pulse_duration_ms),
+                          int(triggers_per_minute), classification, ts)
+        PirEventRepository.save(event)
+    finally:
+        db.close()
 
 
 def start() -> None:
