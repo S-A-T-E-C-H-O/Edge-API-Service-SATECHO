@@ -1,69 +1,29 @@
-"""Tracks which devices are currently online and buffers pending actuator commands.
+"""Tracks which ESP32 devices have been seen recently (online/offline).
 
-A device is considered online if it sent data within the last ONLINE_WINDOW_SECONDS.
-When a device that was offline comes back online, buffered commands are drained
-and republished to its MQTT topic.
+Used by the actuator command subscriber to decide whether a command can be
+forwarded immediately or must be buffered until the device reconnects, and by
+the device status endpoint to report liveness.
 """
 
-import logging
 import threading
 import time
-from collections import defaultdict
-from typing import Callable
 
-logger = logging.getLogger(__name__)
+ONLINE_WINDOW_SECONDS = 60
 
-ONLINE_WINDOW_SECONDS = int(60)
-
-_lock = threading.Lock()
 _last_seen: dict[int, float] = {}
-_pending_commands: dict[int, list[tuple[str, str]]] = defaultdict(list)  # device_id → [(topic, payload)]
-_drain_callback: Callable[[str, str], None] | None = None
-
-
-def set_drain_callback(cb: Callable[[str, str], None]) -> None:
-    """Register the function to call when draining buffered commands (topic, payload)."""
-    global _drain_callback
-    _drain_callback = cb
+_lock = threading.Lock()
 
 
 def mark_seen(device_id: int) -> None:
-    """Record that a device just sent data. Drains any buffered commands."""
+    """Record that a device was just observed (raw MQTT message, heartbeat, or authenticated request)."""
     with _lock:
-        was_offline = _is_offline_locked(device_id)
-        _last_seen[device_id] = time.monotonic()
-        pending = list(_pending_commands.pop(device_id, []))
-
-    if was_offline and pending:
-        logger.info("Device %d back online — draining %d buffered commands", device_id, len(pending))
-        _drain(pending)
+        _last_seen[device_id] = time.time()
 
 
 def is_online(device_id: int) -> bool:
+    """A device is online if it was seen within the last ONLINE_WINDOW_SECONDS."""
     with _lock:
-        return not _is_offline_locked(device_id)
-
-
-def buffer_command(device_id: int, topic: str, payload: str) -> None:
-    with _lock:
-        _pending_commands[device_id].append((topic, payload))
-    logger.info("Buffered actuator command for offline device %d (topic=%s)", device_id, topic)
-
-
-def _is_offline_locked(device_id: int) -> bool:
-    last = _last_seen.get(device_id)
+        last = _last_seen.get(device_id)
     if last is None:
-        return True
-    return (time.monotonic() - last) > ONLINE_WINDOW_SECONDS
-
-
-def _drain(commands: list[tuple[str, str]]) -> None:
-    cb = _drain_callback
-    if cb is None:
-        logger.warning("No drain callback set — buffered commands dropped")
-        return
-    for topic, payload in commands:
-        try:
-            cb(topic, payload)
-        except Exception as exc:
-            logger.error("Error draining command (topic=%s): %s", topic, exc)
+        return False
+    return (time.time() - last) < ONLINE_WINDOW_SECONDS
