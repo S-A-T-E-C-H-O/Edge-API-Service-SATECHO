@@ -37,7 +37,8 @@ def _create_client() -> mqtt.Client:
     username = os.getenv("MQTT_BROKER_USERNAME", "")
     password = os.getenv("MQTT_BROKER_PASSWORD", "")
 
-    client = mqtt.Client(client_id="agrosafe-edge", clean_session=False)
+    client_id = os.getenv("MQTT_CLIENT_ID", "agrosafe-edge")
+    client = mqtt.Client(client_id=client_id, clean_session=False)
 
     def on_connect(c, userdata, flags, rc):
         if rc == 0:

@@ -22,8 +22,8 @@ _EDGE_API_KEY = os.getenv("MQTT_EDGE_API_KEY", "edge-shared-secret-change-me")
 _TOPIC_RAW_SOIL     = "agrosafe/raw/+/+/soil/reading"
 _TOPIC_RAW_SECURITY = "agrosafe/raw/+/+/security/event"
 
-# Default zone_id — ESP32-SATECHO-001 is installed in zone 1
-_DEFAULT_ZONE_ID = 1
+# Default zone_id used when raw ESP32 payloads do not include zone metadata.
+_DEFAULT_ZONE_ID = int(os.getenv("EDGE_ZONE_ID", "1"))
 
 _METRIC_MAP = {
     "humidity_fc28":      "moisture",

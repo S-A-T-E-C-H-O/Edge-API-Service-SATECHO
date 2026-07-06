@@ -25,10 +25,12 @@ logger = logging.getLogger(__name__)
 
 def create_app() -> Flask:
     from iam.interfaces.services import iam_api
+    from pir.interfaces.services import pir_api
     from soil.interfaces.services import soil_api
 
     app = Flask(__name__)
     app.register_blueprint(iam_api)
+    app.register_blueprint(pir_api)
     app.register_blueprint(soil_api)
     return app
 

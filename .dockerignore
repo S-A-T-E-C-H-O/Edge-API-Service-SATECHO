@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.git/
+.idea/
+.pytest_cache/
+agrosafe_edge.db
