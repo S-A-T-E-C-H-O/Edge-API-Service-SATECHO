@@ -14,22 +14,26 @@ def _mark_seen_and_drain(device_id: int) -> None:
     from shared.infrastructure.actuator_command_subscriber import drain_pending
     drain_pending(device_id)
 
+
 logger = logging.getLogger(__name__)
 
 _EDGE_API_KEY = os.getenv("MQTT_EDGE_API_KEY", "edge-shared-secret-change-me")
 
-# Raw topics published by ESP32 (no api_key, no zone_id, embedded format)
-_TOPIC_RAW_SOIL     = "agrosafe/raw/+/+/soil/reading"
+# Raw topics published by ESP32 devices. The zone may be omitted, embedded in
+# each payload, or included in the topic with /zones/{zoneId}/.
+_TOPIC_RAW_SOIL = "agrosafe/raw/+/+/soil/reading"
 _TOPIC_RAW_SECURITY = "agrosafe/raw/+/+/security/event"
+_TOPIC_RAW_ZONE_SOIL = "agrosafe/raw/+/+/zones/+/soil/reading"
+_TOPIC_RAW_ZONE_SECURITY = "agrosafe/raw/+/+/zones/+/security/event"
 
-# Default zone_id used when raw ESP32 payloads do not include zone metadata.
+# Fallback only. Prefer zone_id/zoneId from payload or /zones/{zoneId}/ topic.
 _DEFAULT_ZONE_ID = int(os.getenv("EDGE_ZONE_ID", "1"))
 
 _METRIC_MAP = {
-    "humidity_fc28":      "moisture",
-    "salinity_hr202l":    "ec",
+    "humidity_fc28": "moisture",
+    "salinity_hr202l": "ec",
     "ambient_temp_dht11": "ambient_temperature",
-    "soil_temp_ds18b20":  "temperature",
+    "soil_temp_ds18b20": "temperature",
 }
 
 
@@ -41,6 +45,28 @@ def _extract_ids(topic: str) -> tuple[str, str]:
     """Return (farm_id, device_id) from agrosafe/raw/{farm}/{device}/..."""
     parts = topic.split("/")
     return parts[2], parts[3]
+
+
+def _zone_from_topic(topic: str) -> int | None:
+    """Return zone_id from agrosafe/raw/{farm}/{device}/zones/{zone}/... if present."""
+    parts = topic.split("/")
+    try:
+        zone_idx = parts.index("zones") + 1
+        return int(parts[zone_idx])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _coerce_zone_id(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_zone_id(topic: str, payload_zone=None) -> int:
+    """Prefer payload zone metadata, then topic zone, then EDGE_ZONE_ID fallback."""
+    return _coerce_zone_id(payload_zone) or _zone_from_topic(topic) or _DEFAULT_ZONE_ID
 
 
 def _handle_soil(topic: str, payload: str) -> None:
@@ -58,49 +84,52 @@ def _handle_soil(topic: str, payload: str) -> None:
     _mark_seen_and_drain(int(device_id))
     metrics: dict = {}
     timestamp = _now_iso()
+    zone_id = _resolve_zone_id(topic)
 
-    for r in readings:
-        metric_type = r.get("metricType", "")
+    for reading in readings:
+        metric_type = reading.get("metricType", "")
         field = _METRIC_MAP.get(metric_type)
         if field:
-            metrics[field] = r.get("value")
-        if r.get("timestamp"):
-            timestamp = r["timestamp"]
+            metrics[field] = reading.get("value")
+        if reading.get("timestamp"):
+            timestamp = reading["timestamp"]
+        zone_id = _resolve_zone_id(
+            topic,
+            reading.get("zone_id") or reading.get("zoneId") or zone_id,
+        )
 
     out_payload = json.dumps({
-        "api_key":             _EDGE_API_KEY,
-        "zone_id":             _DEFAULT_ZONE_ID,
-        "moisture":            metrics.get("moisture"),
-        "ec":                  metrics.get("ec"),
-        "ph":                  None,
-        "temperature":         metrics.get("temperature"),
+        "api_key": _EDGE_API_KEY,
+        "zone_id": zone_id,
+        "moisture": metrics.get("moisture"),
+        "ec": metrics.get("ec"),
+        "ph": None,
+        "temperature": metrics.get("temperature"),
         "ambient_temperature": metrics.get("ambient_temperature"),
-        "created_at":          timestamp,
+        "created_at": timestamp,
     })
 
     out_topic = f"agrosafe/{farm_id}/devices/{device_id}/soil/reading"
     client = get_mqtt_client()
 
-    # If we're not connected to the broker right now, the publish would just be
-    # dropped (or queued past paho's outgoing-message limit with no durability
-    # guarantee across a process restart). Fall back to the same SQLite +
-    # retry-queue path the HTTP ingestion route uses, so a broker outage doesn't
-    # silently lose readings (closes the EP-005-US001/US002 "no data loss" gap
-    # for the MQTT relay path, which is the one real firmware actually uses).
     if not client.is_connected():
-        _persist_soil_fallback(int(device_id), int(farm_id), metrics, timestamp)
-        logger.warning("MQTT not connected — soil reading buffered locally (topic=%s)", out_topic)
+        _persist_soil_fallback(int(device_id), int(farm_id), zone_id, metrics, timestamp)
+        logger.warning("MQTT not connected - soil reading buffered locally (topic=%s)", out_topic)
         return
 
     info = client.publish(out_topic, out_payload, qos=1)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        logger.error("Soil relay publish failed (topic=%s): %s — buffering locally", out_topic, mqtt.error_string(info.rc))
-        _persist_soil_fallback(int(device_id), int(farm_id), metrics, timestamp)
+        logger.error(
+            "Soil relay publish failed (topic=%s): %s - buffering locally",
+            out_topic,
+            mqtt.error_string(info.rc),
+        )
+        _persist_soil_fallback(int(device_id), int(farm_id), zone_id, metrics, timestamp)
     else:
-        logger.debug("Soil reading relayed raw→back: %s", out_topic)
+        logger.debug("Soil reading relayed raw-to-back: %s", out_topic)
 
 
-def _persist_soil_fallback(device_id: int, farm_id: int, metrics: dict, timestamp: str) -> None:
+def _persist_soil_fallback(device_id: int, farm_id: int, zone_id: int, metrics: dict, timestamp: str) -> None:
     from dateutil.parser import parse
     from soil.domain.entities import SoilReading
     from soil.infrastructure.repositories import SoilReadingRepository
@@ -114,7 +143,7 @@ def _persist_soil_fallback(device_id: int, farm_id: int, metrics: dict, timestam
     db.connect(reuse_if_open=True)
     try:
         reading = SoilReading(
-            device_id, farm_id, _DEFAULT_ZONE_ID,
+            device_id, farm_id, zone_id,
             metrics.get("moisture") or 0.0, metrics.get("ec") or 0.0, 7.0,
             metrics.get("temperature") or 0.0, recorded_at,
             ambient_temperature=metrics.get("ambient_temperature"),
@@ -140,36 +169,45 @@ def _handle_security(topic: str, payload: str) -> None:
     triggers_per_minute = data.get("triggers_per_minute", 1)
     classification = PirClassificationService.classify(pulse_duration_ms, triggers_per_minute)
     recorded_at = data.get("detectedAt", _now_iso())
+    zone_id = _resolve_zone_id(topic, data.get("zone_id") or data.get("zoneId"))
 
     out_payload = json.dumps({
-        "api_key":              _EDGE_API_KEY,
-        "zone_id":              _DEFAULT_ZONE_ID,
-        "pulse_duration_ms":    pulse_duration_ms,
-        "triggers_per_minute":  triggers_per_minute,
-        "classification":       classification.value,
-        "recorded_at":          recorded_at,
+        "api_key": _EDGE_API_KEY,
+        "zone_id": zone_id,
+        "pulse_duration_ms": pulse_duration_ms,
+        "triggers_per_minute": triggers_per_minute,
+        "classification": classification.value,
+        "recorded_at": recorded_at,
     })
 
     out_topic = f"agrosafe/{farm_id}/devices/{device_id}/security/event"
     client = get_mqtt_client()
 
     if not client.is_connected():
-        _persist_security_fallback(int(device_id), int(farm_id), pulse_duration_ms, triggers_per_minute,
-                                    classification, recorded_at)
-        logger.warning("MQTT not connected — security event buffered locally (topic=%s)", out_topic)
+        _persist_security_fallback(
+            int(device_id), int(farm_id), zone_id, pulse_duration_ms,
+            triggers_per_minute, classification, recorded_at,
+        )
+        logger.warning("MQTT not connected - security event buffered locally (topic=%s)", out_topic)
         return
 
     info = client.publish(out_topic, out_payload, qos=1)
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        logger.error("Security relay publish failed (topic=%s): %s — buffering locally", out_topic, mqtt.error_string(info.rc))
-        _persist_security_fallback(int(device_id), int(farm_id), pulse_duration_ms, triggers_per_minute,
-                                    classification, recorded_at)
+        logger.error(
+            "Security relay publish failed (topic=%s): %s - buffering locally",
+            out_topic,
+            mqtt.error_string(info.rc),
+        )
+        _persist_security_fallback(
+            int(device_id), int(farm_id), zone_id, pulse_duration_ms,
+            triggers_per_minute, classification, recorded_at,
+        )
     else:
-        logger.debug("Security event relayed raw→back: %s — classification=%s", out_topic, classification.value)
+        logger.debug("Security event relayed raw-to-back: %s - classification=%s", out_topic, classification.value)
 
 
-def _persist_security_fallback(device_id: int, farm_id: int, pulse_duration_ms, triggers_per_minute,
-                                classification, recorded_at: str) -> None:
+def _persist_security_fallback(device_id: int, farm_id: int, zone_id: int, pulse_duration_ms,
+                               triggers_per_minute, classification, recorded_at: str) -> None:
     from dateutil.parser import parse
     from pir.domain.entities import PirEvent
     from pir.infrastructure.repositories import PirEventRepository
@@ -182,8 +220,10 @@ def _persist_security_fallback(device_id: int, farm_id: int, pulse_duration_ms, 
 
     db.connect(reuse_if_open=True)
     try:
-        event = PirEvent(device_id, farm_id, _DEFAULT_ZONE_ID, float(pulse_duration_ms),
-                          int(triggers_per_minute), classification, ts)
+        event = PirEvent(
+            device_id, farm_id, zone_id, float(pulse_duration_ms),
+            int(triggers_per_minute), classification, ts,
+        )
         PirEventRepository.save(event)
     finally:
         db.close()
@@ -193,7 +233,9 @@ def start() -> None:
     """Subscribe to raw ESP32 topics. Call once at app startup."""
     register_handler(_TOPIC_RAW_SOIL, _handle_soil)
     register_handler(_TOPIC_RAW_SECURITY, _handle_security)
+    register_handler(_TOPIC_RAW_ZONE_SOIL, _handle_soil)
+    register_handler(_TOPIC_RAW_ZONE_SECURITY, _handle_security)
     logger.info(
-        "Device ingest subscriber started — topics=%s, %s",
-        _TOPIC_RAW_SOIL, _TOPIC_RAW_SECURITY,
+        "Device ingest subscriber started - topics=%s, %s, %s, %s",
+        _TOPIC_RAW_SOIL, _TOPIC_RAW_SECURITY, _TOPIC_RAW_ZONE_SOIL, _TOPIC_RAW_ZONE_SECURITY,
     )
