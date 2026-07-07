@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
 
@@ -32,8 +33,14 @@ def register_handler(topic: str, handler: callable) -> None:
 
 
 def _create_client() -> mqtt.Client:
-    host = os.getenv("MQTT_BROKER_HOST", "localhost")
-    port = int(os.getenv("MQTT_BROKER_PORT", "1883"))
+    broker_url = os.getenv("MQTT_BROKER_URL")
+    if broker_url:
+        parsed = urlparse(broker_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 1883
+    else:
+        host = os.getenv("MQTT_BROKER_HOST", "localhost")
+        port = int(os.getenv("MQTT_BROKER_PORT", "1883"))
     username = os.getenv("MQTT_BROKER_USERNAME", "")
     password = os.getenv("MQTT_BROKER_PASSWORD", "")
 
